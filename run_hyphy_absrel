@@ -1,0 +1,98 @@
+import os
+import subprocess
+import json
+import pandas as pd
+from multiprocessing import Pool
+
+# --- CONFIGURATION ---
+# 1. Path to your folder with .fasta files
+aln_dir = "/home/insan/CompGenomics/dnds/new_coding_alignment_26_Jan"
+
+# 2. Path to your species tree
+tree_file = "/home/insan/CompGenomics/dnds/species_tree.txt"
+
+# 3. Path where you want to save the .json files
+output_dir = "/home/insan/CompGenomics/dnds/hyphy_json_results"
+
+# 4. Final summary filename
+final_csv = "HyPhy_aBSREL_Master_Summary.csv"
+
+# Threading logic:
+# We run 10 genes at a time, each using 8 CPU cores = 80 cores total.
+threads = 10
+cpus_per_run = 8
+
+os.makedirs(output_dir, exist_ok=True)
+
+
+def run_hyphy_task(fasta_file):
+    og_id = fasta_file.replace(".fasta", "")
+    fasta_path = os.path.join(aln_dir, fasta_file)
+    json_out = os.path.join(output_dir, f"{og_id}.json")
+
+    # Bypassing the menu: "hyphy absrel" tells it exactly which test to run
+    cmd = [
+        "hyphy", "absrel",
+        "--alignment", fasta_path,
+        "--tree", tree_file,
+        "--branches", "All",
+        "--output", json_out
+    ]
+
+    # Pass the CPU limit to HyPhy
+    env = os.environ.copy()
+    env["HYPHY_NUM_CPUS"] = str(cpus_per_run)
+
+    try:
+        # Run the command
+        subprocess.run(cmd, env=env, capture_output=True, check=True)
+
+        # Immediately parse the resulting JSON to collect data for the CSV
+        with open(json_out, "r") as f:
+            res_data = json.load(f)
+
+        sig_branches = []
+        branch_results = res_data.get("branch attributes", {}).get("0", {})
+
+        for branch, attr in branch_results.items():
+            p_val = attr.get("Corrected P-value", 1.0)
+
+            # We look for Corrected P-value <= 0.05
+            if p_val <= 0.05:
+                omega = attr.get("Non-synonymous to synonymous ratio", 0)
+                sig_branches.append(f"{branch}(w={round(omega, 2)})")
+
+        return {
+            "OG_ID": og_id,
+            "Significant_Branches": ", ".join(sig_branches) if sig_branches else "None",
+            "Num_Sig_Branches": len(sig_branches),
+            "Status": "Success"
+        }
+
+    except Exception as e:
+        return {
+            "OG_ID": og_id,
+            "Significant_Branches": "N/A",
+            "Num_Sig_Branches": 0,
+            "Status": f"Error: {str(e)}"
+        }
+
+
+if __name__ == "__main__":
+    # Get list of all fasta files
+    files = [f for f in os.listdir(aln_dir) if f.endswith(".fasta")]
+
+    print(f"Starting HyPhy aBSREL Batch Run: {len(files)} files found.")
+    print(f"Utilizing {threads * cpus_per_run} cores...")
+
+    # Parallel execution
+    with Pool(processes=threads) as pool:
+        final_results = pool.map(run_hyphy_task, files)
+
+    # Convert the list of dictionaries to a DataFrame and save
+    df = pd.DataFrame(final_results)
+    df.to_csv(final_csv, index=False)
+
+    print("\nAll runs complete!")
+    print(f"Summary CSV saved: {final_csv}")
+    print(f"Individual JSONs saved in: {output_dir}")
